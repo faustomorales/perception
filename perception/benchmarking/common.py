@@ -118,6 +118,7 @@ class Filterable(ABC):
         for field, included in kwargs.items():
             existing = self._df[field].unique()
             if not all(inc in existing for inc in included):
+                # pylint: disable=consider-using-f-string
                 message = 'Did not find {missing} in column {field} dataset.'.format(
                     missing=', '.join(
                         [str(inc) for inc in included if inc not in existing]),
@@ -128,6 +129,7 @@ class Filterable(ABC):
 
 
 class Saveable(Filterable):
+    # pylint: disable=no-member
     @classmethod
     def load(cls,
              path_to_zip_or_directory: str,
@@ -348,7 +350,7 @@ class BenchmarkHashes(Filterable):
                     distance_to_closest_image = distance_matrix.min(axis=1)
                     distance_to_correct_image = np.ma.masked_array(
                         distance_matrix, np.logical_not(mask)).min(axis=1)
-                    distance_matrix_incorrect_image = np.ma.masked_array(
+                    distance_matrix_incorrect_image: np.ndarray = np.ma.masked_array(
                         distance_matrix, mask)
                     distance_to_incorrect_image = distance_matrix_incorrect_image.min(
                         axis=1)

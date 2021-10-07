@@ -400,7 +400,7 @@ def _get_keyframes(filepath):
             args, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
         out, err = p.communicate()
         if p.returncode != 0:
-            raise ValueError("{out}: {err}".format(out=str(out), err=str(err)))
+            raise ValueError(f"{str(out)}: {str(err)}")
         data = json.loads(out.decode('utf-8'))['frames']
         frames = [
             f['coded_picture_number'] for f in data if f['pict_type'] == 'I'
@@ -420,7 +420,7 @@ def get_video_properties(filepath):
             stderr=subprocess.PIPE) as p:
         out, err = p.communicate()
         if p.returncode != 0:
-            raise ValueError("{out}: {err}".format(out=str(out), err=str(err)))
+            raise ValueError(f"{str(out)}: {str(err)}")
         data = json.loads(out.decode("utf-8"))["streams"][0]
         numerator, denominator = tuple(
             map(int, data["avg_frame_rate"].split("/")[:2]))
@@ -549,7 +549,7 @@ def read_video_to_generator_ffmpeg(
             filters.append(f"scale={width}:{height}:flags={interp}")
         cmd += f" -i '{filepath}'"
         if filters:
-            cmd += " -vf '{fstring}'".format(fstring=",".join(filters))
+            cmd += " -vf '{fstring}'".format(fstring=",".join(filters))  # pylint: disable=consider-using-f-string
         cmd += " -pix_fmt rgb24 -f image2pipe -vcodec rawvideo -"
         LOGGER.debug("running ffmpeg with: %s", cmd)
         framebytes = width * height * channels
