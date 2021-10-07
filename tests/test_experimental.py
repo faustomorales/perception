@@ -1,15 +1,19 @@
 # pylint: disable=protected-access,invalid-name
 import os
 import tempfile
+import sqlite3
 import imgaug
 import cv2
+import numpy as np
 import pandas as pd
+import perception.hashers as ph
 import perception.testing as pt
 import perception.benchmarking as pb
 import perception.hashers.tools as pht
 import perception.benchmarking.image_transforms as pbit
 import perception.experimental.local_descriptor_deduplication as ldd
 import perception.experimental.approximate_deduplication as ad
+import perception.experimental.ann as pea
 
 
 def test_sift_deduplication():
@@ -99,3 +103,55 @@ def test_handling_bad_file_case(caplog):
         record for record in caplog.records if missing_file in record.message)
     assert missing_file_warning
     assert missing_file_warning.levelname == "WARNING"
+
+
+def test_approximate_nearest_neighbors():
+    for hasher, threshold in [(ph.PHash(), 0.1), (ph.PHashU8(), 5)]:
+        metadata = pd.DataFrame(
+            hasher.compute_parallel(pt.DEFAULT_TEST_IMAGES))
+        metadata = pd.concat([metadata for n in range(100)], ignore_index=True)
+
+        # Create a temporary database of hashes.
+        table = "test-hashes"
+        con = sqlite3.connect("")
+        with con:
+            metadata.assign(
+                id=np.arange(len(metadata)),
+                hash=metadata["hash"].apply(
+                    lambda h: hasher.string_to_vector(h).tobytes())).to_sql(
+                        name=table, con=con)
+
+        # Create the nearest neighbors object from the database.
+        ann = pea.ApproximateNearestNeighbors.from_database(
+            con=con,
+            table=table,
+            paramstyle="qmark",
+            hash_length=hasher.hash_length,
+            metadata_columns=["filepath", "hash"],
+            dtype=hasher.dtype,
+            distance_metric=hasher.distance_metric)
+
+        # Make the search exhaustive.
+        ann.set_nprobe(ann.nlist)
+
+        # Create a non-exact query.
+        query_filepath = metadata.iloc[3]["filepath"]
+        query_hash = hasher.compute(cv2.blur(pht.read(query_filepath), (3, 3)))
+
+        # Obtain matches.
+        matches = pd.json_normalize(
+            ann.search(
+                queries=[{
+                    "id": "test-id",
+                    "hash": query_hash
+                }],
+                threshold=threshold,
+                k=100)[0]["matches"])
+
+        # Ensure that we (1) found matches, (2) that they're within the threshold,
+        # (3) that the distances are correct, and (4) that the filepath is the same as the query.
+        assert len(matches) > 0
+        assert matches["distance"].lt(threshold).all()
+        assert (matches["metadata.hash"].apply(lambda h: hasher.compute_distance(query_hash, np.frombuffer(h, hasher.dtype))) == matches["distance"]).all()
+        assert matches["metadata.filepath"].eq(query_filepath).all()
+        con.close()

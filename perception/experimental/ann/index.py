@@ -29,8 +29,34 @@ class QueryDecodingFailure(Exception):
     pass
 
 
+SUPPORTED_CONFIGURATIONS = [("uint8", "euclidean"), ("bool", "hamming")]
+
+
+def build_empty_index(hash_length: int, nlist: int, dtype: str,
+                      distance_metric: str):
+    if dtype == "bool" and distance_metric == "hamming":
+        return faiss.IndexBinaryIVF(
+            faiss.IndexBinaryFlat(hash_length), hash_length, nlist)
+    if dtype == "uint8" and distance_metric == "euclidean":
+        return faiss.IndexIVFFlat(
+            faiss.IndexFlatL2(hash_length), hash_length, nlist)
+    raise NotImplementedError(
+        "Unsupported dtype / distance_metric combination.")
+
+
+def prepare_array_for_faiss(x):
+    if x.dtype == "uint8":
+        return x.astype("float32")
+    if x.dtype == "bool":
+        assert x.shape[
+            1] % 8 == 0, "Boolean hashes must be packable into 8-bit integers."
+        return np.array([np.packbits(xi) for xi in x])
+    raise NotImplementedError(f"Unsupported dtype: {x.dtype}")
+
+
+# pylint: disable=consider-using-f-string
 def build_query(table, ids, paramstyle, columns):
-    query = 'SELECT {} FROM {} WHERE id in {}'
+    query = "SELECT {} FROM '{}' WHERE id in {}"
     if paramstyle == 'pyformat':
         sql = query.format(','.join(columns), table, '%(ids)s')
         params = {'ids': tuple(ids)}
@@ -77,8 +103,11 @@ class ApproximateNearestNeighbors:
 
     Args:
         con: A database connection from which to obtain metadata for
-            matched hashes.
+            matched hashes
         table: The table in the database that we should query for metadata.
+            At a minimum, the table must have the following two columns:
+            id (an integer ID used to correlate hashes with the FAISS index),
+            and hash (the perceptual hash in bytes).
         paramstyle: The parameter style for the given database
         index: A FAISS index (or filepath to a FAISS index)
         hash_length: The length of the hash that is being matched against.
@@ -98,8 +127,9 @@ class ApproximateNearestNeighbors:
             dtype='uint8',
             distance_metric='euclidean',
     ):
-        assert dtype == 'uint8', 'Only unsigned 8-bit integer hashes are supported at this time.'
-        assert distance_metric == 'euclidean', 'Only euclidean distance is supported at this time.'
+        assert (
+            dtype, distance_metric
+        ) in SUPPORTED_CONFIGURATIONS, "Unsupported dtype / distance_metric combination."
         if isinstance(index, str):
             index = faiss.read_index(index)
         self.con = con
@@ -124,13 +154,13 @@ class ApproximateNearestNeighbors:
                       metadata_columns=None,
                       index=None,
                       gpu=False,
+                      nlist=None,
                       dtype='uint8',
                       distance_metric='euclidean'):
         """Train and build a FAISS index from a database connection.
-
         Args:
             con: A database connection from which to obtain metadata for
-                matched hashes.
+                matched hashes
             table: The table in the database that we should query for metadata.
             paramstyle: The parameter style for the given database
             hash_length: The length of the hash that is being matched against.
@@ -145,24 +175,27 @@ class ApproximateNearestNeighbors:
                 any existing vectors will be discarded, and the index will be
                 repopulated with the current contents of the database.
             gpu: If true, will attempt to carry out training on a GPU.
+            nlist: The number of separate lists to train for.
             dtype: The data type for the vectors
             distance_metric: The distance metric for the vectors
         """
-        assert dtype == 'uint8', 'Only unsigned 8-bit integer hashes are supported at this time.'
-        assert distance_metric == 'euclidean', 'Only euclidean distance is supported at this time.'
+        assert (
+            dtype, distance_metric
+        ) in SUPPORTED_CONFIGURATIONS, "Unsupported dtype / distance_metric combination."
         if index is None:
             # Train the index using the practices from
             # https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index#if-below-1m-vectors-ivfx
             ntotal = pd.read_sql(
-                sql="select count(*) as count from hashes",
+                sql=f"select count(*) as count from '{table}'",
                 con=con).iloc[0]['count']
-            assert train_size <= ntotal, 'Cannot train on more hashes than are available.'
-            nlist = int(min(4 * np.sqrt(ntotal), ntotal / 39))
-            min_train_size = 39 * nlist
+            if nlist is None:
+                nlist = max(int(min(4 * np.sqrt(ntotal), ntotal / 39)), 1)
+            min_train_size = min(39 * nlist, ntotal)
             if ids_train is not None:
                 train_size = len(ids_train)
             if train_size is None:
                 train_size = min_train_size
+            assert train_size <= ntotal, 'Cannot train on more hashes than are available.'
             assert train_size >= min_train_size, f'Training an index used for {ntotal} hashes requires at least {min_train_size} training hashes.'
             if ids_train is None:
                 ids_train = np.random.choice(
@@ -173,14 +206,16 @@ class ApproximateNearestNeighbors:
                 ids=ids_train,
                 paramstyle=paramstyle,
                 extra_columns=['hash'])
-            x_train = np.array([
-                np.frombuffer(h, dtype=dtype) for h in df_train['hash']
-            ]).astype('float32')
+            x_train = np.array(
+                [np.frombuffer(h, dtype=dtype) for h in df_train['hash']])
             assert x_train.shape[
                 1] == hash_length, 'Hashes are of incorrect length.'
-
-            index = faiss.IndexIVFFlat(
-                faiss.IndexFlatL2(hash_length), hash_length, nlist)
+            x_train = prepare_array_for_faiss(x_train)
+            index = build_empty_index(
+                hash_length=hash_length,
+                nlist=nlist,
+                dtype=dtype,
+                distance_metric=distance_metric)
             if gpu:
                 res = faiss.StandardGpuResources()
                 gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
@@ -193,11 +228,12 @@ class ApproximateNearestNeighbors:
 
         # Add hashes to the index in chunks.
         for df_add in pd.read_sql(
-                sql=f"SELECT id, hash FROM {table}", con=con,
+                sql=f"SELECT id, hash FROM '{table}'",
+                con=con,
                 chunksize=chunksize):
-            x_add = np.array([
-                np.frombuffer(h, dtype=dtype) for h in df_add['hash']
-            ]).astype('float32')
+            x_add = prepare_array_for_faiss(
+                np.array(
+                    [np.frombuffer(h, dtype=dtype) for h in df_add['hash']]))
             index.add_with_ids(x_add, df_add['id'].values)
         return cls(
             con=con,
@@ -258,49 +294,54 @@ class ApproximateNearestNeighbors:
         return pht.vector_to_string(
             vector, dtype=self.dtype, hash_format=hash_format)
 
-    def search(self,
-               queries: typing.List[QueryInput],
-               threshold: int = None,
-               threshold_func: typing.Callable[[np.ndarray], int] = None,
-               hash_format='base64',
-               k=1):
+    def search(
+            self,
+            queries: typing.List[QueryInput],
+            threshold: float = None,
+            threshold_func: typing.Callable[[np.ndarray], np.ndarray] = None,
+            hash_format='base64',
+            k=1):
         """Search the index and return matches.
-
         Args:
             queries: A list of queries in the form of {"id": <id>, "hash": "<hash_string>"}
             threshold: The threshold to use for matching. Takes precedence over threshold_func.
             threshold_func: A function that, given a query vector, returns the desired match threshold for that query.
             hash_format: The hash format used for the strings in the query.
             k: The number of nearest neighbors to return.
-
         Returns:
             Matches in the form of a list of dicts of the form:
             { "id": <query ID>, "matches": [{"distance": <distance>, "id": <match ID>, "metadata": {}}]}
-
             The metadata consists of the contents of the metadata columns specified for this matching
             instance.
         """
         try:
-            xq = np.array([
-                self.string_to_vector(h['hash'], hash_format=hash_format)
-                for h in queries
-            ]).astype('float32')
+            xq = prepare_array_for_faiss(
+                np.array([
+                    self.string_to_vector(h['hash'], hash_format=hash_format)
+                    for h in queries
+                ]))
         except Exception as exc:
             raise QueryDecodingFailure('Failed to parse hash query.') from exc
-        if threshold:
+        if threshold is not None:
             thresholds = np.ones((len(xq), 1)) * threshold
-        if not threshold and threshold_func:
+        elif threshold_func is not None:
             thresholds = threshold_func(xq)
         else:
             thresholds = np.ones((len(xq), 1)) * np.inf
         distances, indices = self.index.search(xq, k=k)
-        distances = np.sqrt(distances)
-        metadata = None if not self.metadata_columns else self.query_by_id(
-            ids=np.unique(indices[distances < thresholds]))
+        if self.distance_metric == "euclidean":
+            distances = np.sqrt(distances)
+        if self.distance_metric == "hamming":
+            distances = distances / self.hash_length
+        ids_to_query = np.unique(
+            indices[(distances < thresholds) & (indices != -1)])
+        metadata = None if (not self.metadata_columns
+                            or len(ids_to_query) == 0) else self.query_by_id(
+                                ids=ids_to_query)
         matches: typing.List[QueryMatch] = []
         for match_distances, match_ids, q, q_threshold in zip(
                 distances, indices, queries, thresholds):
-            match_filter = match_distances < q_threshold
+            match_filter = (match_distances < q_threshold) & (match_ids != -1)
             match_ids = match_ids[match_filter]
             match_distances = match_distances[match_filter]
             match: QueryMatch = {'id': q['id'], 'matches': []}
@@ -383,19 +424,28 @@ class ApproximateNearestNeighbors:
         Args:
             nprobe: The new value for nprobe
         """
-        faiss.ParameterSpace().set_index_parameter(self.index, "nprobe",
-                                                   nprobe)
-        return faiss.downcast_index(self.index).nprobe
+        try:
+            faiss.ParameterSpace().set_index_parameter(self.index, "nprobe",
+                                                       nprobe)
+        except TypeError:
+            self.index.nprobe = nprobe
+        return self.nprobe
 
     @property
     def nlist(self):
         """The number of lists in the index."""
-        return faiss.downcast_index(self.index).nlist
+        try:
+            return faiss.downcast_index(self.index).nlist
+        except TypeError:
+            return self.index.nlist
 
     @property
     def nprobe(self):
         """The current value of nprobe."""
-        return faiss.downcast_index(self.index).nprobe
+        try:
+            return faiss.downcast_index(self.index).nprobe
+        except TypeError:
+            return self.index.nprobe
 
     @property
     def ntotal(self):
