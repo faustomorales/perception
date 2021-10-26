@@ -32,19 +32,33 @@ class QueryDecodingFailure(Exception):
 SUPPORTED_CONFIGURATIONS = [("uint8", "euclidean"), ("bool", "hamming")]
 
 
+def compute_correct_index_dimensionality(hash_length: int,
+                                         distance_metric: str, dtype: str):
+    """Compute the correct index dimensionality for a hash length."""
+    if dtype == "bool" and distance_metric == "hamming":
+        hash_length += 0 if hash_length % 8 == 0 else 8 - (hash_length % 8)
+        return hash_length
+    if dtype == "uint8" and distance_metric == "euclidean":
+        return hash_length
+    raise NotImplementedError(
+        "Unsupported dtype / distance_metric combination.")
+
+
 def build_empty_index(hash_length: int, nlist: int, dtype: str,
                       distance_metric: str):
+    """Build an empty FAISS index."""
+    d = compute_correct_index_dimensionality(
+        hash_length=hash_length, distance_metric=distance_metric, dtype=dtype)
     if dtype == "bool" and distance_metric == "hamming":
-        return faiss.IndexBinaryIVF(
-            faiss.IndexBinaryFlat(hash_length), hash_length, nlist)
+        return faiss.IndexBinaryIVF(faiss.IndexBinaryFlat(d), d, nlist)
     if dtype == "uint8" and distance_metric == "euclidean":
-        return faiss.IndexIVFFlat(
-            faiss.IndexFlatL2(hash_length), hash_length, nlist)
+        return faiss.IndexIVFFlat(faiss.IndexFlatL2(d), d, nlist)
     raise NotImplementedError(
         "Unsupported dtype / distance_metric combination.")
 
 
 def prepare_array_for_faiss(x):
+    """Convert a hash array so that it is compatible with FAISS."""
     if x.dtype == "uint8":
         return x.astype("float32")
     if x.dtype == "bool":
@@ -138,7 +152,10 @@ class ApproximateNearestNeighbors:
         self.table = table
         self.metadata_columns = metadata_columns
         self.paramstyle = paramstyle
-        assert self.index.d == self.hash_length, 'Index is incompatible with hash length.'
+        assert self.index.d == compute_correct_index_dimensionality(
+            hash_length=self.hash_length,
+            distance_metric=self.distance_metric,
+            dtype=self.dtype), 'Index is incompatible with hash length.'
 
     @classmethod
     def from_database(cls,
