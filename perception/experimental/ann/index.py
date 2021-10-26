@@ -48,8 +48,6 @@ def prepare_array_for_faiss(x):
     if x.dtype == "uint8":
         return x.astype("float32")
     if x.dtype == "bool":
-        assert x.shape[
-            1] % 8 == 0, "Boolean hashes must be packable into 8-bit integers."
         return np.array([np.packbits(xi) for xi in x])
     raise NotImplementedError(f"Unsupported dtype: {x.dtype}")
 

@@ -106,7 +106,8 @@ def test_handling_bad_file_case(caplog):
 
 
 def test_approximate_nearest_neighbors():
-    for hasher, threshold in [(ph.PHash(), 0.1), (ph.PHashU8(), 5)]:
+    for hasher, threshold in [(ph.PHash(), 0.1),
+                              (ph.PHashU8(exclude_first_term=True), 5)]:
         metadata = pd.DataFrame(
             hasher.compute_parallel(pt.DEFAULT_TEST_IMAGES))
         metadata = pd.concat([metadata for n in range(100)], ignore_index=True)
